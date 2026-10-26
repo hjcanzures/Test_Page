@@ -14,6 +14,8 @@
  * server-side — client checks are for UX, the server is the real gate):
  *   - Only https:// API endpoints are accepted (http:// only for localhost).
  *   - No cookies/credentials are sent, nothing is stored in the browser.
+ *   - Ratings (query, answer, source names, thumbs up/down) are sent to
+ *     POST {apiBase}/feedback and stored server-side.
  *   - All server text is rendered via textContent or escaped before markup.
  *   - Responses are shape-checked and size-capped before display.
  */
@@ -43,6 +45,7 @@
       "Got a question about enrollment or programs? I've got you!",
     ],
     networkErrorMessage: "Couldn't reach Neu right now. Check your connection and try again.",
+    supportUrl: 'https://neu.edu.ph/main/contact-us',
 
     // Limits. maxQueryChars must not exceed MAX_QUERY_CHARS in query_lambda.py.
     maxQueryChars: 500,
@@ -56,6 +59,8 @@
   const PANEL_ID = 'neu-panel';
   const INPUT_MAX_HEIGHT_PX = 100;
   const MAX_ANSWER_CHARS = 4000;
+  const MAX_SOURCES = 10;
+  const MAX_SOURCE_NAME_CHARS = 80;
   const MAX_SERVER_ERROR_CHARS = 200;
   const MINUTE_MS = 60 * 1000;
 
@@ -222,8 +227,34 @@
     return html || '<p></p>';
   }
 
+  /** Random per-page-load ID that groups one visitor's ratings. Kept in memory only. */
+  function createSessionId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+
   function sanitizeUserInput(text) {
     return String(text).replace(CONTROL_CHARS, '').trim();
+  }
+
+  /** Unique, trimmed, length-capped filenames from an untrusted `sources` value. */
+  function extractSourceNames(sources) {
+    if (!Array.isArray(sources)) return [];
+    const names = [];
+    for (const source of sources) {
+      const name =
+        source && typeof source.filename === 'string'
+          ? source.filename.replace(CONTROL_CHARS, '').trim().slice(0, MAX_SOURCE_NAME_CHARS)
+          : '';
+      if (name && !names.includes(name)) names.push(name);
+      if (names.length >= MAX_SOURCES) break;
+    }
+    return names;
   }
 
   /** Picks a user-facing message for a failed HTTP response. */
@@ -263,6 +294,10 @@
       hintIndex: 0,
       sendTimestamps: [], // ms timestamps of recent sends, for the client-side limiter
       history: [], // completed turns sent to the server: [{ role, content }, ...]
+      responseCount: 0,
+      activeSpeech: null,
+      feedback: new Map(), // session only; also emitted as a neu:feedback event
+      sessionId: createSessionId(),
     };
 
     /* ---------- Hint rotation ---------- */
@@ -291,6 +326,7 @@
         inputEl.focus();
         if (messagesEl.children.length === 0) addBotMessage(config.greeting);
       } else {
+        stopReading();
         launcher.focus();
       }
     }
@@ -328,21 +364,232 @@
       scrollToBottom();
     }
 
-    function addBotMessage(text) {
+    function addSupportLink(message) {
+      if (message.querySelector('.neu-support')) return;
+      let url;
+      try {
+        url = new URL(config.supportUrl, document.baseURI);
+        if (url.protocol !== 'https:' && url.protocol !== 'mailto:') return;
+        if (url.username || url.password) return;
+      } catch (error) {
+        return;
+      }
+      const link = document.createElement('a');
+      link.className = 'neu-support';
+      link.href = url.href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Contact university support ↗';
+      message.appendChild(link);
+    }
+
+    function needsSupport(text, data) {
+      // Prefer a backend flag; recognize existing fallback wording for older APIs.
+      return Boolean(data && (data.needsSupport === true || data.confidence === 'low' || data.status === 'fallback')) ||
+        /(?:don['’]t|do not) have (?:that|any|enough|this) information|don['’]t have any documents|(?:cannot|can['’]t|unable to) (?:answer|confirm|verify)|not enough information/i.test(text);
+    }
+
+    // Static outline icons; no server content is inserted into SVG markup.
+    function actionIcon(paths) {
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths}</svg>`;
+    }
+    const COPY_ICON = actionIcon('<rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>');
+    const UP_ICON = actionIcon('<path d="M7 10v10H4a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1h3Zm0 0 5-7a2 2 0 0 1 2 2l-1 5h5a3 3 0 0 1 3 3l-2 6a2 2 0 0 1-2 1H7"/>');
+    const DOWN_ICON = actionIcon('<path d="M7 14V4H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h3Zm0 0 5 7a2 2 0 0 0 2-2l-1-5h5a3 3 0 0 0 3-3l-2-6a2 2 0 0 0-2-1H7"/>');
+
+    const SPEAKER_ICON = actionIcon('<path d="m11 4-5 4H3v8h3l5 4V4Z"/><path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>');
+    const EXPAND_ICON = actionIcon('<path d="M14 4h6v6m0-6-8 8M4 14v6h6"/>');
+
+    function stopReading() {
+      if (!state.activeSpeech) return;
+      window.speechSynthesis.cancel();
+      state.activeSpeech.button.setAttribute('aria-pressed', 'false');
+      state.activeSpeech.button.setAttribute('aria-label', 'Read answer aloud');
+      state.activeSpeech.button.title = 'Read answer aloud';
+      state.activeSpeech = null;
+    }
+
+    /** Sends one rating to the backend. Resolves true on success, false on any failure. */
+    async function submitFeedback(entry) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+      try {
+        const response = await fetch(`${apiBase}/feedback`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: state.sessionId,
+            responseId: entry.responseId,
+            rating: entry.rating,
+            query: entry.query,
+            answer: entry.answer,
+            sources: entry.sources,
+          }),
+          signal: controller.signal,
+          mode: 'cors',
+          credentials: 'omit',
+          cache: 'no-store',
+          referrerPolicy: 'strict-origin-when-cross-origin',
+        });
+        return response.ok;
+      } catch (error) {
+        return false;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    function addFeedback(message, query, answer, names, requiresSupport) {
+      const responseId = `${Date.now()}-${++state.responseCount}`;
+      const controls = document.createElement('div');
+      controls.className = 'neu-feedback';
+      controls.setAttribute('role', 'group');
+      controls.setAttribute('aria-label', 'Rate this answer');
+      const status = document.createElement('span');
+      status.className = 'neu-feedback__status';
+      status.setAttribute('role', 'status');
+      const copyButton = document.createElement('button');
+      copyButton.type = 'button';
+      copyButton.className = 'neu-feedback__copy';
+      copyButton.innerHTML = COPY_ICON;
+      copyButton.title = 'Copy answer';
+      copyButton.setAttribute('aria-label', 'Copy answer');
+      copyButton.addEventListener('click', async () => {
+        copyButton.disabled = true;
+        try {
+          await navigator.clipboard.writeText(answer);
+          status.textContent = 'Answer copied';
+        } catch (error) {
+          status.textContent = 'Unable to copy. Select the answer to copy it.';
+        } finally {
+          copyButton.disabled = false;
+        }
+      });
+      controls.appendChild(copyButton);
+      const readButton = document.createElement('button');
+      readButton.type = 'button';
+      readButton.className = 'neu-feedback__read';
+      readButton.innerHTML = SPEAKER_ICON;
+      readButton.title = 'Read answer aloud';
+      readButton.setAttribute('aria-label', 'Read answer aloud');
+      readButton.setAttribute('aria-pressed', 'false');
+      readButton.addEventListener('click', () => {
+        if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+          status.textContent = 'Read aloud is unavailable in this browser.';
+          return;
+        }
+        const isReading = state.activeSpeech?.button === readButton;
+        stopReading();
+        if (isReading) return;
+        const speech = new window.SpeechSynthesisUtterance(message.querySelector('.neu-bubble').innerText || answer);
+        state.activeSpeech = { button: readButton, speech };
+        readButton.setAttribute('aria-pressed', 'true');
+        readButton.setAttribute('aria-label', 'Stop reading');
+        readButton.title = 'Stop reading';
+        const finish = () => {
+          if (state.activeSpeech?.speech !== speech) return;
+          readButton.setAttribute('aria-pressed', 'false');
+          readButton.setAttribute('aria-label', 'Read answer aloud');
+          readButton.title = 'Read answer aloud';
+          state.activeSpeech = null;
+        };
+        speech.onend = finish;
+        speech.onerror = () => { finish(); status.textContent = 'Unable to read this answer aloud.'; };
+        window.speechSynthesis.speak(speech);
+      });
+      controls.appendChild(readButton);
+      const buttons = [];
+      for (const [rating, icon, label] of [
+        ['up', UP_ICON, 'Helpful answer'], ['down', DOWN_ICON, 'Unhelpful answer'],
+      ]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'neu-feedback__button';
+        button.innerHTML = icon;
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.setAttribute('aria-pressed', 'false');
+        button.addEventListener('click', async () => {
+          if (state.feedback.get(responseId)?.rating === rating) return;
+          const previous = state.feedback.get(responseId);
+          const entry = { responseId, query, answer, sources: names.slice(), rating,
+            createdAt: new Date().toISOString() };
+          state.feedback.set(responseId, entry);
+          if (state.feedback.size > 100) state.feedback.delete(state.feedback.keys().next().value);
+          buttons.forEach((item) => item.button.setAttribute('aria-pressed', String(item.rating === rating)));
+          if (rating === 'down') addSupportLink(message);
+          else if (!requiresSupport) message.querySelector('.neu-support')?.remove();
+          // Still emitted so a host page can listen if it wants to.
+          root.dispatchEvent(new CustomEvent('neu:feedback', {
+            bubbles: true, detail: { ...entry, sources: entry.sources.slice() },
+          }));
+
+          // Lock both buttons while saving so rapid up/down clicks can't arrive out of order.
+          buttons.forEach((item) => { item.button.disabled = true; });
+          status.textContent = 'Saving…';
+          const saved = await submitFeedback(entry);
+          buttons.forEach((item) => { item.button.disabled = false; });
+
+          if (saved) {
+            status.textContent = rating === 'up' ? 'Thanks! Marked helpful' : 'Thanks! Marked unhelpful';
+          } else {
+            // Roll back so the user can tap again instead of silently losing the rating.
+            if (previous) state.feedback.set(responseId, previous);
+            else state.feedback.delete(responseId);
+            buttons.forEach((item) => item.button.setAttribute('aria-pressed', String(previous?.rating === item.rating)));
+            status.textContent = "Couldn't save your feedback. Please try again.";
+          }
+          scrollToBottom();
+        });
+        buttons.push({ button, rating });
+        controls.appendChild(button);
+      }
+      const expandButton = document.createElement('button');
+      expandButton.type = 'button';
+      expandButton.className = 'neu-feedback__expand';
+      expandButton.innerHTML = EXPAND_ICON;
+      expandButton.title = 'Expand chat';
+      expandButton.setAttribute('aria-label', 'Expand chat');
+      expandButton.setAttribute('aria-pressed', String(root.classList.contains('neu-widget--expanded')));
+      expandButton.addEventListener('click', () => {
+        const expanded = !root.classList.contains('neu-widget--expanded');
+        root.classList.toggle('neu-widget--expanded', expanded);
+        root.querySelectorAll('.neu-feedback__expand').forEach((button) => {
+          button.setAttribute('aria-pressed', String(expanded));
+          button.setAttribute('aria-label', expanded ? 'Restore chat size' : 'Expand chat');
+          button.title = expanded ? 'Restore chat size' : 'Expand chat';
+        });
+        scrollToBottom();
+      });
+      controls.appendChild(expandButton);
+      controls.appendChild(status);
+      message.appendChild(controls);
+    }
+
+    function addBotMessage(text, sources, options = {}) {
       const message = createMessage('bot');
       const bubble = createBubble();
       bubble.innerHTML = renderMarkdown(text); // renderMarkdown escapes everything first
       message.appendChild(bubble);
+
+      const names = extractSourceNames(sources);
+      if (options.query) {
+        const requiresSupport = needsSupport(text, options.data);
+        addFeedback(message, options.query, text, names, requiresSupport);
+        if (requiresSupport) addSupportLink(message);
+      }
+
       messagesEl.appendChild(message);
       scrollToBottom();
     }
 
-    function addErrorMessage(text) {
+    function addErrorMessage(text, offerSupport = false) {
       const message = createMessage('bot');
       message.classList.add('neu-msg--error');
       const bubble = createBubble();
       bubble.textContent = text;
       message.appendChild(bubble);
+      if (offerSupport) addSupportLink(message);
       messagesEl.appendChild(message);
       scrollToBottom();
     }
@@ -437,12 +684,12 @@
         hideTyping();
 
         if (!response.ok) {
-          addErrorMessage(describeHttpError(response.status, data));
+          addErrorMessage(describeHttpError(response.status, data), true);
         } else if (!data || typeof data.answer !== 'string' || data.answer.trim() === '') {
-          addErrorMessage('Neu sent back something unexpected. Please try again.');
+          addErrorMessage('Neu sent back something unexpected. Please try again.', true);
         } else {
           const answer = data.answer.slice(0, MAX_ANSWER_CHARS);
-          addBotMessage(answer);
+          addBotMessage(answer, data.sources, { query: text, data });
 
           // Save the turn as a user/assistant pair so history always starts
           // with a user turn and alternates. Blocked turns are left out so
@@ -460,7 +707,8 @@
         addErrorMessage(
           error && error.name === 'AbortError'
             ? 'Neu took too long to respond. Please try again.'
-            : config.networkErrorMessage
+            : config.networkErrorMessage,
+          true
         );
       } finally {
         clearTimeout(timeoutId);
